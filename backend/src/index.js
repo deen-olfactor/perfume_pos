@@ -251,6 +251,91 @@ app.post('/api/stock_adjustments', (req, res) => {
   } finally { db.close(); }
 });
 
+// Transactions API
+app.get('/api/transactions', (req, res) => {
+  const db = getDb();
+  try {
+    const rows = db.prepare('SELECT * FROM transactions ORDER BY created_at DESC').all();
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ ok: false, error: err.message });
+  } finally { db.close(); }
+});
+
+app.get('/api/transactions/:id', (req, res) => {
+  const id = req.params.id;
+  const db = getDb();
+  try {
+    const tx = db.prepare('SELECT * FROM transactions WHERE id = ?').get(id);
+    if (!tx) return res.status(404).json({ error: 'Transaction not found' });
+    const lines = db.prepare('SELECT * FROM transaction_lines WHERE transaction_id = ?').all(id);
+    res.json({ ...tx, lines });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ ok: false, error: err.message });
+  } finally { db.close(); }
+});
+
+app.post('/api/transactions', (req, res) => {
+  const { total_cents, paid_cents, payment_method, user_id, lines } = req.body;
+  if (!Array.isArray(lines) || lines.length === 0) return res.status(400).json({ error: 'lines array is required' });
+  const txId = crypto.randomUUID();
+  const db = getDb();
+  try {
+    const insertTx = db.prepare('INSERT INTO transactions (id, total_cents, paid_cents, payment_method, user_id) VALUES (?, ?, ?, ?, ?)');
+    const insertLine = db.prepare('INSERT INTO transaction_lines (id, transaction_id, variant_id, qty, unit_price_cents, waste_ml) VALUES (?, ?, ?, ?, ?, ?)');
+    const insertStock = db.prepare('INSERT INTO stock_entries (id, variant_id, qty, batch, source) VALUES (?, ?, ?, ?, ?)');
+    const insertWaste = db.prepare('INSERT INTO waste_records (id, transaction_id, variant_id, amount_ml, reason, recorded_by) VALUES (?, ?, ?, ?, ?, ?)');
+    const insertAudit = db.prepare('INSERT INTO audit_trail (id, entity, entity_id, action, changes, user_id) VALUES (?, ?, ?, ?, ?, ?)');
+
+    const trx = db.transaction(() => {
+      insertTx.run(txId, total_cents || 0, paid_cents || 0, payment_method || null, user_id || null);
+      for (const l of lines) {
+        const lineId = crypto.randomUUID();
+        const variantCheck = db.prepare('SELECT id FROM variants WHERE id = ?').get(l.variant_id);
+        if (!variantCheck) throw new Error('variant not found: ' + l.variant_id);
+        const qty = Number(l.qty);
+        if (Number.isNaN(qty) || qty <= 0) throw new Error('invalid qty');
+        insertLine.run(lineId, txId, l.variant_id, qty, l.unit_price_cents || 0, l.waste_ml || 0);
+        // consume stock by inserting negative stock entry
+        const stockId = crypto.randomUUID();
+        insertStock.run(stockId, l.variant_id, -Math.abs(qty), null, 'sale');
+        insertAudit.run(crypto.randomUUID(), 'stock_entries', stockId, 'consume', JSON.stringify({ variant_id: l.variant_id, qty: -Math.abs(qty) }), user_id || null);
+        if (l.waste_ml && Number(l.waste_ml) > 0) {
+          const wasteId = crypto.randomUUID();
+          insertWaste.run(wasteId, txId, l.variant_id, Number(l.waste_ml), l.waste_reason || 'waste', user_id || null);
+        }
+      }
+    });
+
+    trx();
+    const created = db.prepare('SELECT * FROM transactions WHERE id = ?').get(txId);
+    res.status(201).json(created);
+  } catch (err) {
+    console.error('transaction create error', err);
+    res.status(400).json({ ok: false, error: err.message });
+  } finally { db.close(); }
+});
+
+// Waste endpoint (standalone)
+app.post('/api/waste_records', (req, res) => {
+  const { transaction_id, variant_id, amount_ml, reason, recorded_by } = req.body;
+  if (!variant_id || typeof amount_ml !== 'number') return res.status(400).json({ error: 'variant_id and numeric amount_ml are required' });
+  const id = crypto.randomUUID();
+  const db = getDb();
+  try {
+    db.prepare('INSERT INTO waste_records (id, transaction_id, variant_id, amount_ml, reason, recorded_by) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(id, transaction_id || null, variant_id, amount_ml, reason || null, recorded_by || null);
+    const row = db.prepare('SELECT * FROM waste_records WHERE id = ?').get(id);
+    res.status(201).json(row);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ ok: false, error: err.message });
+  } finally { db.close(); }
+});
+
+// Export app for tests
 module.exports = app;
 
 // Start server when run directly

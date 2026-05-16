@@ -24,6 +24,20 @@ describe('API integration', () => {
     const totalResp = await request(app).get(`/api/stock/variant/${varId}`);
     expect(totalResp.status).toBe(200);
     expect(totalResp.body.qty).toBeGreaterThanOrEqual(50);
-  }, 20000);
+
+    // create a transaction consuming 5 units
+    const txResp = await request(app).post('/api/transactions').send({
+      total_cents: 5000,
+      paid_cents: 5000,
+      payment_method: 'cash',
+      user_id: null,
+      lines: [{ variant_id: varId, qty: 5, unit_price_cents: 1000 }]
+    });
+    expect(txResp.status).toBe(201);
+
+    const afterResp = await request(app).get(`/api/stock/variant/${varId}`);
+    expect(afterResp.status).toBe(200);
+    expect(afterResp.body.qty).toBeGreaterThanOrEqual(45);
+  }, 30000);
 
 });
