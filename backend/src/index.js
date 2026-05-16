@@ -295,13 +295,31 @@ app.post('/api/transactions', (req, res) => {
         const lineId = crypto.randomUUID();
         const variantCheck = db.prepare('SELECT id FROM variants WHERE id = ?').get(l.variant_id);
         if (!variantCheck) throw new Error('variant not found: ' + l.variant_id);
-        const qty = Number(l.qty);
+        let qty = Number(l.qty);
         if (Number.isNaN(qty) || qty <= 0) throw new Error('invalid qty');
         insertLine.run(lineId, txId, l.variant_id, qty, l.unit_price_cents || 0, l.waste_ml || 0);
-        // consume stock by inserting negative stock entry
-        const stockId = crypto.randomUUID();
-        insertStock.run(stockId, l.variant_id, -Math.abs(qty), null, 'sale');
-        insertAudit.run(crypto.randomUUID(), 'stock_entries', stockId, 'consume', JSON.stringify({ variant_id: l.variant_id, qty: -Math.abs(qty) }), user_id || null);
+
+        // FIFO consumption: consume from oldest positive stock_entries
+        let remaining = qty;
+        const availableStmt = db.prepare('SELECT id, variant_id, qty, batch FROM stock_entries WHERE variant_id = ? AND qty > 0 ORDER BY received_at ASC');
+        const availables = availableStmt.all(l.variant_id);
+        for (const avail of availables) {
+          if (remaining <= 0) break;
+          const take = Math.min(remaining, avail.qty);
+          if (take <= 0) continue;
+          // create a negative stock entry referencing the consumed batch (store consumed stock_entry id in batch field)
+          const stockId = crypto.randomUUID();
+          insertStock.run(stockId, l.variant_id, -Math.abs(take), avail.id, 'sale');
+          insertAudit.run(crypto.randomUUID(), 'stock_entries', stockId, 'consume', JSON.stringify({ from_stock_entry: avail.id, variant_id: l.variant_id, qty: -Math.abs(take) }), user_id || null);
+          remaining -= take;
+        }
+        if (remaining > 0) {
+          // not enough stock: still create negative entry to reflect backorder/negative stock
+          const stockId = crypto.randomUUID();
+          insertStock.run(stockId, l.variant_id, -Math.abs(remaining), null, 'sale');
+          insertAudit.run(crypto.randomUUID(), 'stock_entries', stockId, 'consume_overdraw', JSON.stringify({ variant_id: l.variant_id, qty: -Math.abs(remaining) }), user_id || null);
+        }
+
         if (l.waste_ml && Number(l.waste_ml) > 0) {
           const wasteId = crypto.randomUUID();
           insertWaste.run(wasteId, txId, l.variant_id, Number(l.waste_ml), l.waste_reason || 'waste', user_id || null);
@@ -332,6 +350,47 @@ app.post('/api/waste_records', (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ ok: false, error: err.message });
+  } finally { db.close(); }
+});
+
+// Refund endpoint: creates reversing transaction and returns stock
+app.post('/api/transactions/:id/refund', (req, res) => {
+  const originalId = req.params.id;
+  const { reason, user_id } = req.body;
+  const db = getDb();
+  try {
+    const original = db.prepare('SELECT * FROM transactions WHERE id = ?').get(originalId);
+    if (!original) return res.status(404).json({ error: 'Original transaction not found' });
+    const lines = db.prepare('SELECT * FROM transaction_lines WHERE transaction_id = ?').all(originalId);
+    if (!lines || lines.length === 0) return res.status(400).json({ error: 'No lines to refund' });
+
+    const refundId = crypto.randomUUID();
+    const insertTx = db.prepare('INSERT INTO transactions (id, total_cents, paid_cents, payment_method, user_id) VALUES (?, ?, ?, ?, ?)');
+    const insertLine = db.prepare('INSERT INTO transaction_lines (id, transaction_id, variant_id, qty, unit_price_cents, waste_ml) VALUES (?, ?, ?, ?, ?, ?)');
+    const insertStock = db.prepare('INSERT INTO stock_entries (id, variant_id, qty, batch, source) VALUES (?, ?, ?, ?, ?)');
+    const insertAudit = db.prepare('INSERT INTO audit_trail (id, entity, entity_id, action, changes, user_id) VALUES (?, ?, ?, ?, ?, ?)');
+
+    const trx = db.transaction(() => {
+      // negative totals to indicate refund (could also use separate refund table)
+      insertTx.run(refundId, -(original.total_cents || 0), -(original.paid_cents || 0), original.payment_method || 'refund', user_id || null);
+      for (const ol of lines) {
+        const rid = crypto.randomUUID();
+        insertLine.run(rid, refundId, ol.variant_id, -Math.abs(ol.qty), ol.unit_price_cents || 0, 0);
+        // return stock by inserting positive stock entry
+        const stockId = crypto.randomUUID();
+        insertStock.run(stockId, ol.variant_id, Math.abs(ol.qty), null, 'refund');
+        insertAudit.run(crypto.randomUUID(), 'stock_entries', stockId, 'refund_return', JSON.stringify({ from_transaction: originalId, variant_id: ol.variant_id, qty: Math.abs(ol.qty), reason }), user_id || null);
+      }
+      // audit original transaction refunded
+      insertAudit.run(crypto.randomUUID(), 'transactions', originalId, 'refunded', JSON.stringify({ refund_id: refundId, reason }), user_id || null);
+    });
+
+    trx();
+    const created = db.prepare('SELECT * FROM transactions WHERE id = ?').get(refundId);
+    res.status(201).json(created);
+  } catch (err) {
+    console.error('refund error', err);
+    res.status(400).json({ ok: false, error: err.message });
   } finally { db.close(); }
 });
 

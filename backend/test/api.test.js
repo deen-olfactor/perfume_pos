@@ -34,10 +34,19 @@ describe('API integration', () => {
       lines: [{ variant_id: varId, qty: 5, unit_price_cents: 1000 }]
     });
     expect(txResp.status).toBe(201);
+    const txId = txResp.body.id || txResp.body.id;
 
     const afterResp = await request(app).get(`/api/stock/variant/${varId}`);
     expect(afterResp.status).toBe(200);
     expect(afterResp.body.qty).toBeGreaterThanOrEqual(45);
-  }, 30000);
+
+    // refund the transaction
+    const refundResp = await request(app).post(`/api/transactions/${txId}/refund`).send({ reason: 'customer return' });
+    expect(refundResp.status).toBe(201);
+
+    const afterRefund = await request(app).get(`/api/stock/variant/${varId}`);
+    expect(afterRefund.status).toBe(200);
+    expect(afterRefund.body.qty).toBeGreaterThanOrEqual(50);
+  }, 40000);
 
 });
